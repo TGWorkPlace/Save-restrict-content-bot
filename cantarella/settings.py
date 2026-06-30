@@ -249,6 +249,69 @@ async def set_suffix_cmd(client: Client, message: Message):
 
 
 # ======================================================
+# Metadata - direct commands (mirrors /prefix and /suffix)
+#
+# /title /author /artist /description /comment
+# /video_title /audio_title /subtitle_title
+#
+# Added as a reliable, button-independent way to set metadata. The
+# button/PENDING_INPUT panel could be silently intercepted by start.py's
+# catch-all callback handler depending on handler registration order, so
+# these commands give a direct DB write path that never touches callbacks
+# at all - same one-shot-or-prompt pattern as /prefix and /suffix.
+# ======================================================
+METADATA_COMMAND_FIELD_MAP = {
+    "title":          "METADATA_TITLE",
+    "author":         "METADATA_AUTHOR",
+    "artist":         "METADATA_ARTIST",
+    "description":    "METADATA_DESCRIPTION",
+    "comment":        "METADATA_COMMENT",
+    "video_title":    "METADATA_VIDEO_TITLE",
+    "audio_title":    "METADATA_AUDIO_TITLE",
+    "subtitle_title": "METADATA_SUBTITLE_TITLE",
+}
+
+
+@Client.on_message(filters.command(list(METADATA_COMMAND_FIELD_MAP.keys())) & filters.private)
+async def metadata_field_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    if not await db.is_user_exist(user_id):
+        await db.add_user(user_id, message.from_user.first_name)
+
+    cmd = message.command[0].lower()
+    field = METADATA_COMMAND_FIELD_MAP.get(cmd)
+    if not field:
+        return  # shouldn't happen, filter already restricts to known commands
+
+    label = METADATA_LABELS.get(field, field)
+
+    if len(message.command) < 2:
+        current = await db.get_metadata_field(user_id, field)
+        PENDING_INPUT[user_id] = {"type": "metadata", "field": field}
+        return await message.reply_text(
+            f"<b>{label}</b>\n\n"
+            f"<b>Current:</b> <code>{current or 'Not set'}</code>\n\n"
+            f"<i>Send the new value as a text message, or send "
+            f"<code>clear</code> to remove it.</i>\n\n"
+            f"<i>Tip: you can also do this in one step with "
+            f"<code>/{cmd} YourText</code> or <code>/{cmd} clear</code>.</i>\n\n"
+            f"<i>Send <code>{{file_name}}</code> as the value to automatically "
+            f"use the saved file's name.</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+    value = message.text.split(None, 1)[1].strip()
+    if value.lower() == "clear":
+        await db.set_metadata_field(user_id, field, None)
+        PENDING_INPUT.pop(user_id, None)
+        return await message.reply_text(f"✅ <b>{label} cleared.</b>", parse_mode=enums.ParseMode.HTML)
+
+    await db.set_metadata_field(user_id, field, value)
+    PENDING_INPUT.pop(user_id, None)
+    await message.reply_text(f"✅ <b>{label} set:</b> <code>{value}</code>", parse_mode=enums.ParseMode.HTML)
+
+
+# ======================================================
 # /metadata - Open the metadata settings panel
 # ======================================================
 @Client.on_message(filters.command("metadata") & filters.private)
@@ -259,8 +322,11 @@ async def metadata_cmd(client: Client, message: Message):
 
     text = (
         "<b>🎬 Metadata Settings</b>\n\n"
-        "<i>Tap a field below to view/edit it. These values are embedded "
-        "into your saved video/audio files via ffmpeg.</i>\n\n"
+        "<i>Tap a field below to view/edit it, or use a direct command:</i>\n\n"
+        "<code>/title</code> <code>/author</code> <code>/artist</code>\n"
+        "<code>/description</code> <code>/comment</code>\n"
+        "<code>/video_title</code> <code>/audio_title</code> <code>/subtitle_title</code>\n\n"
+        "<i>e.g. <code>/title My Custom Title</code> or <code>/title clear</code></i>\n\n"
         "<i>Tip: send <code>{file_name}</code> (literally) as the value for "
         "any field to automatically use the saved file's name there - this "
         "is commonly used for the Title field.</i>"
@@ -445,7 +511,10 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
     elif data == "metadata_btn":
         text = (
             "<b>🎬 Metadata Settings</b>\n\n"
-            "<i>Tap a field below to view/edit it.</i>\n\n"
+            "<i>Tap a field below to view/edit it, or use a direct command:</i>\n\n"
+            "<code>/title</code> <code>/author</code> <code>/artist</code>\n"
+            "<code>/description</code> <code>/comment</code>\n"
+            "<code>/video_title</code> <code>/audio_title</code> <code>/subtitle_title</code>\n\n"
             "<i>Tip: send <code>{file_name}</code> (literally) as the value to "
             "automatically use the saved file's name there.</i>"
         )
