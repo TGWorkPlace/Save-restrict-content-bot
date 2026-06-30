@@ -61,6 +61,7 @@ class Database:
     # Telegram Channel @cantarellabots
     # Premium Support
     async def add_premium(self, id, expiry_date):
+        # When user buys premium, we also reset their limits just in case
         await self.col.update_one({'id': int(id)}, {
             '$set': {
                 'is_premium': True,
@@ -128,25 +129,6 @@ class Database:
     async def get_metadata_field(self, id, field):
         meta = await self.get_metadata(id)
         return meta.get(field, None)
-    # --------------------------------------------------------
-    # NEW: Persistent "Pending Input" Support
-    #
-    # WHY THIS EXISTS: settings.py used to track "this user is expected
-    # to type a value next" in a plain in-memory Python dict. On Koyeb's
-    # free tier, the service can idle/restart between the user tapping a
-    # button and typing their reply, which silently wipes that dict —
-    # the bot then receives the text, finds no pending state, and does
-    # nothing at all (no error, no reply). Storing this in MongoDB instead
-    # makes it survive restarts/cold-starts, fixing the "no response"
-    # bug for good.
-    # --------------------------------------------------------
-    async def set_pending_input(self, id, data):
-        await self.col.update_one({'id': int(id)}, {'$set': {'pending_input': data}}, upsert=True)
-    async def get_pending_input(self, id):
-        user = await self.col.find_one({'id': int(id)})
-        return user.get('pending_input') if user else None
-    async def clear_pending_input(self, id):
-        await self.col.update_one({'id': int(id)}, {'$unset': {'pending_input': ""}})
     # Custom Sleep Support (used by /setsleep, /getsleep)
     async def set_sleep(self, id, values):
         await self.col.update_one({'id': int(id)}, {'$set': {'sleep_values': values}})
@@ -179,29 +161,47 @@ class Database:
     # NEW FEATURES: Daily Limits (Free User Restriction)
     # --------------------------------------------------------
     async def check_limit(self, id):
+        """
+        Checks if a user has hit their daily limit.
+        Returns: True if BLOCKED (limit reached), False if ALLOWED.
+        """
         user = await self.col.find_one({'id': int(id)})
         if not user:
-            return False
+            return False # Should be added via add_user, but safe fallback
+       
+        # 1. Premium Check: Always allowed
         if user.get('is_premium'):
             return False
+        # 2. Check Time Reset
         now = datetime.datetime.now()
         reset_time = user.get('limit_reset_time')
+       
+        # If reset time has passed or was never set, reset count to 0
         if reset_time is None or now >= reset_time:
             await self.col.update_one(
                 {'id': int(id)},
                 {'$set': {'daily_usage': 0, 'limit_reset_time': None}}
             )
-            return False
+            return False # Allowed (count is 0)
+        # 3. Check Count
         usage = user.get('daily_usage', 0)
         if usage >= 10:
-            return True
-        return False
+            return True # Blocked
+       
+        return False # Allowed
     async def add_traffic(self, id):
+        """
+        Increments usage count.
+        If it's the first save of the cycle, sets the 24h timer.
+        """
         user = await self.col.find_one({'id': int(id)})
+       
+        # If premium, do nothing or track stats if you want (currently strictly for limit logic)
         if user.get('is_premium'):
             return
         now = datetime.datetime.now()
         reset_time = user.get('limit_reset_time')
+        # Logic: If timer is not running (None), start it for 24 hours from NOW.
         if reset_time is None:
             new_reset_time = now + datetime.timedelta(hours=24)
             await self.col.update_one(
@@ -209,6 +209,7 @@ class Database:
                 {'$set': {'daily_usage': 1, 'limit_reset_time': new_reset_time}}
             )
         else:
+            # Just increment
             await self.col.update_one(
                 {'id': int(id)},
                 {'$inc': {'daily_usage': 1}}
