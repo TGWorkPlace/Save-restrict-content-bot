@@ -1,4 +1,4 @@
-import os
+import html
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import RPCError
@@ -46,7 +46,7 @@ def _truncate(value, length=18):
 
 async def metadata_panel_buttons(user_id):
     """Builds the metadata panel with a live value preview and a dedicated
-    delete button under every field (so users don't have to type 'clear')."""
+    delete button under every field that currently has a value set."""
     current_meta = await db.get_metadata(user_id)
     rows = []
     for field in METADATA_FIELDS:
@@ -85,8 +85,56 @@ async def safe_edit(callback_query: CallbackQuery, text, reply_markup):
                 text, reply_markup=reply_markup, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True
             )
     except Exception:
-        # Fall back to sending a fresh message if editing fails for any reason
         await callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode=enums.ParseMode.HTML)
+
+
+async def edit_prompt_message(client: Client, chat_id, message_id, text, reply_markup):
+    """Edit a previously-sent prompt message by chat_id/message_id (used from
+    the plain message handler, where we don't have a CallbackQuery to edit
+    through). Falls back to caption-edit for photo messages, and to sending
+    a brand new message if the original can no longer be edited (deleted,
+    too old, etc.) so the user ALWAYS gets a visible response."""
+    try:
+        await client.edit_message_text(
+            chat_id, message_id, text, reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True
+        )
+        return
+    except Exception:
+        pass
+    try:
+        await client.edit_message_caption(
+            chat_id, message_id, caption=text, reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
+        return
+    except Exception:
+        pass
+    await client.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=enums.ParseMode.HTML)
+
+
+def metadata_field_text(field, value, status=None):
+    """Builds the field-detail panel text. `status` is an optional short
+    suffix like 'Set successfully ✅️' or 'Cleared ✅️' appended right after
+    the current value, exactly as requested."""
+    label = METADATA_LABELS.get(field, field)
+    safe_value = html.escape(value) if value else "Not set (original metadata preserved)"
+    status_part = f" {status}" if status else ""
+    return (
+        f"<b>{label}</b>\n\n"
+        f"<b>Current value:</b> <code>{safe_value}</code>{status_part}\n\n"
+        f"<i>Send the new value as a text message.</i>\n"
+        f"<i>Send <code>{{file_name}}</code> to use the saved filename automatically.</i>\n"
+        f"<i>Send <code>clear</code> to remove this field.</i>"
+    )
+
+
+def metadata_field_buttons(field):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete This Field", callback_data=f"metadel_{field}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="metadata_btn"),
+         InlineKeyboardButton("❌ Close", callback_data="close_btn")]
+    ])
 
 
 # ======================================================
@@ -162,32 +210,32 @@ async def set_dump_chat(client: Client, message: Message):
     except RPCError as e:
         return await message.reply_text(
             f"❌ <b>Unable to Access Chat</b>\n\n"
-            f"<code>{e}</code>\n\n"
+            f"<code>{html.escape(str(e))}</code>\n\n"
             f"<i>Make sure the bot has been added to that chat as a member/admin "
             f"and the chat ID is correct (forward a message from it, or use "
             f"@username_to_id_bot to confirm).</i>",
             parse_mode=enums.ParseMode.HTML
         )
     except Exception as e:
-        return await message.reply_text(f"❌ <b>Unable to Access Chat</b>\n<i>{e}</i>", parse_mode=enums.ParseMode.HTML)
+        return await message.reply_text(f"❌ <b>Unable to Access Chat</b>\n<i>{html.escape(str(e))}</i>", parse_mode=enums.ParseMode.HTML)
 
     try:
         await client.send_message(chat_id, "✅ This chat is now set as your dump/forward destination.")
     except RPCError as e:
         return await message.reply_text(
             f"❌ <b>Bot Cannot Post In That Chat</b>\n\n"
-            f"<code>{e}</code>\n\n"
+            f"<code>{html.escape(str(e))}</code>\n\n"
             f"<i>Add the bot as an admin with \"Post Messages\" permission, then try again.</i>",
             parse_mode=enums.ParseMode.HTML
         )
     except Exception as e:
-        return await message.reply_text(f"❌ <b>Bot Cannot Post In That Chat</b>\n<i>{e}</i>", parse_mode=enums.ParseMode.HTML)
+        return await message.reply_text(f"❌ <b>Bot Cannot Post In That Chat</b>\n<i>{html.escape(str(e))}</i>", parse_mode=enums.ParseMode.HTML)
 
     await db.set_dump_chat(user_id, chat_id)
     await message.reply_text(
         f"✅ <b>Dump Chat Set Successfully</b>\n\n"
         f"<b>Forward To:</b> <code>{chat_id}</code>\n"
-        f"<b>Title:</b> {chat_title}\n\n"
+        f"<b>Title:</b> {html.escape(chat_title)}\n\n"
         f"<i>All future saved files will also be copied there automatically.</i>",
         parse_mode=enums.ParseMode.HTML
     )
@@ -207,7 +255,7 @@ async def set_prefix_cmd(client: Client, message: Message):
         PENDING_INPUT[user_id] = {"type": "prefix", "field": None}
         return await message.reply_text(
             f"<b>🏷 Set File Prefix</b>\n\n"
-            f"<b>Current:</b> <code>{current or 'Not set'}</code>\n\n"
+            f"<b>Current:</b> <code>{html.escape(current) if current else 'Not set'}</code>\n\n"
             f"<i>Send the new prefix as a text message, or send "
             f"<code>clear</code> to remove it.</i>\n\n"
             f"<i>Tip: you can also do this in one step with "
@@ -222,7 +270,7 @@ async def set_prefix_cmd(client: Client, message: Message):
 
     await db.set_prefix(user_id, value)
     PENDING_INPUT.pop(user_id, None)
-    await message.reply_text(f"✅ <b>Prefix Set:</b> <code>{value}</code>", parse_mode=enums.ParseMode.HTML)
+    await message.reply_text(f"✅ <b>Prefix Set:</b> <code>{html.escape(value)}</code>", parse_mode=enums.ParseMode.HTML)
 
 
 @Client.on_message(filters.command("suffix") & filters.private)
@@ -236,7 +284,7 @@ async def set_suffix_cmd(client: Client, message: Message):
         PENDING_INPUT[user_id] = {"type": "suffix", "field": None}
         return await message.reply_text(
             f"<b>🏷 Set File Suffix</b>\n\n"
-            f"<b>Current:</b> <code>{current or 'Not set'}</code>\n\n"
+            f"<b>Current:</b> <code>{html.escape(current) if current else 'Not set'}</code>\n\n"
             f"<i>Send the new suffix as a text message, or send "
             f"<code>clear</code> to remove it.</i>\n\n"
             f"<i>Tip: you can also do this in one step with "
@@ -251,7 +299,7 @@ async def set_suffix_cmd(client: Client, message: Message):
 
     await db.set_suffix(user_id, value)
     PENDING_INPUT.pop(user_id, None)
-    await message.reply_text(f"✅ <b>Suffix Set:</b> <code>{value}</code>", parse_mode=enums.ParseMode.HTML)
+    await message.reply_text(f"✅ <b>Suffix Set:</b> <code>{html.escape(value)}</code>", parse_mode=enums.ParseMode.HTML)
 
 
 # ======================================================
@@ -279,6 +327,20 @@ async def metadata_cmd(client: Client, message: Message):
 # who tapped a metadata/prefix/suffix button (or used the bare command)
 # and is expected to type a value. Registered in group=-1 so it runs
 # BEFORE the generic link-saving handler in start.py (default group 0).
+#
+# FIX 1: every user-supplied value is now html.escape()-d before being
+# embedded in an HTML-parsed message. Previously, a value containing
+# '&', '<' or '>' (extremely common in real titles, e.g. "Tom & Jerry")
+# made Telegram reject the whole reply with a parse-entities error —
+# which Pyrogram swallows silently, looking exactly like "no response".
+#
+# FIX 2: the whole body is wrapped in try/except so a failure can never
+# again result in total silence — the user gets an error message instead.
+#
+# FIX 3 (requested UX): metadata confirmations now EDIT the original
+# prompt message in place (storing its chat_id/message_id when the field
+# was opened) instead of sending a separate reply, showing the field
+# panel with "Current value: ... Set successfully ✅️" baked in.
 # ======================================================
 @Client.on_message(filters.text & filters.private & ~filters.regex(r"^/"), group=-1)
 async def capture_pending_input(client: Client, message: Message):
@@ -289,33 +351,54 @@ async def capture_pending_input(client: Client, message: Message):
 
     value = message.text.strip()
 
-    if pending["type"] == "metadata":
-        field = pending["field"]
-        if value.lower() == "clear":
-            await db.set_metadata_field(user_id, field, None)
-            await message.reply_text(f"✅ <b>{METADATA_LABELS.get(field, field)} cleared.</b>", parse_mode=enums.ParseMode.HTML)
-        else:
-            await db.set_metadata_field(user_id, field, value)
+    try:
+        if pending["type"] == "metadata":
+            field = pending["field"]
+            prompt_chat_id = pending.get("chat_id")
+            prompt_message_id = pending.get("message_id")
+
+            if value.lower() == "clear":
+                await db.set_metadata_field(user_id, field, None)
+                new_text = metadata_field_text(field, None, status="Cleared ✅️")
+            else:
+                await db.set_metadata_field(user_id, field, value)
+                new_text = metadata_field_text(field, value, status="Set successfully ✅️")
+
+            if prompt_chat_id and prompt_message_id:
+                await edit_prompt_message(
+                    client, prompt_chat_id, prompt_message_id, new_text, metadata_field_buttons(field)
+                )
+            else:
+                # No stored prompt reference (e.g. field was opened via an
+                # older session) — fall back to a fresh reply so the user
+                # still always gets visible confirmation.
+                await message.reply_text(new_text, reply_markup=metadata_field_buttons(field), parse_mode=enums.ParseMode.HTML)
+
+        elif pending["type"] == "prefix":
+            if value.lower() == "clear":
+                await db.set_prefix(user_id, None)
+                await message.reply_text("✅ <b>Prefix Cleared.</b>", parse_mode=enums.ParseMode.HTML)
+            else:
+                await db.set_prefix(user_id, value)
+                await message.reply_text(f"✅ <b>Prefix Set:</b> <code>{html.escape(value)}</code>", parse_mode=enums.ParseMode.HTML)
+
+        elif pending["type"] == "suffix":
+            if value.lower() == "clear":
+                await db.set_suffix(user_id, None)
+                await message.reply_text("✅ <b>Suffix Cleared.</b>", parse_mode=enums.ParseMode.HTML)
+            else:
+                await db.set_suffix(user_id, value)
+                await message.reply_text(f"✅ <b>Suffix Set:</b> <code>{html.escape(value)}</code>", parse_mode=enums.ParseMode.HTML)
+
+    except Exception as e:
+        # Defensive net: guarantees the user is never met with silence again.
+        try:
             await message.reply_text(
-                f"✅ <b>{METADATA_LABELS.get(field, field)} updated:</b>\n<code>{value}</code>",
+                f"❌ <b>Something went wrong saving that value.</b>\n<code>{html.escape(str(e))}</code>",
                 parse_mode=enums.ParseMode.HTML
             )
-
-    elif pending["type"] == "prefix":
-        if value.lower() == "clear":
-            await db.set_prefix(user_id, None)
-            await message.reply_text("✅ <b>Prefix Cleared.</b>", parse_mode=enums.ParseMode.HTML)
-        else:
-            await db.set_prefix(user_id, value)
-            await message.reply_text(f"✅ <b>Prefix Set:</b> <code>{value}</code>", parse_mode=enums.ParseMode.HTML)
-
-    elif pending["type"] == "suffix":
-        if value.lower() == "clear":
-            await db.set_suffix(user_id, None)
-            await message.reply_text("✅ <b>Suffix Cleared.</b>", parse_mode=enums.ParseMode.HTML)
-        else:
-            await db.set_suffix(user_id, value)
-            await message.reply_text(f"✅ <b>Suffix Set:</b> <code>{value}</code>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
 
     PENDING_INPUT.pop(user_id, None)
     message.stop_propagation()
@@ -324,16 +407,15 @@ async def capture_pending_input(client: Client, message: Message):
 # ======================================================
 # Callbacks - Full Settings Navigation
 #
-# FIX: this handler is now pinned to group=-1 (same as the text-input
-# capture handler above). Previously it relied on the default group (0),
-# which it shared with the catch-all `@Client.on_callback_query()` in
-# start.py. Pyrogram only runs the FIRST matching handler within a group,
-# and which file's plugin gets registered first is not guaranteed (it
-# depends on filesystem/import order) — so depending on load order, the
-# generic start.py handler could silently swallow metadata_btn / meta_*
-# callbacks before they ever reached this logic, making "Metadata
-# Settings" appear randomly broken. Pinning this to group=-1 makes it
-# always run first, deterministically.
+# FIX: pinned to group=-1 (same as the text-input handler above).
+# Previously this shared the default group (0) with the catch-all
+# `@Client.on_callback_query()` in start.py. Pyrogram only runs the
+# FIRST matching handler within a group, and a filter-less handler
+# always matches — so depending on plugin load order, start.py's
+# generic handler could swallow metadata_btn / meta_* taps before they
+# ever reached this logic. group=-1 makes this deterministic: it
+# ALWAYS runs first. (You also need to set start.py's catch-all to
+# group=1 — see the note below this file.)
 # ======================================================
 @Client.on_callback_query(filters.regex(
     "^(cmd_list_btn|dump_chat_btn|thumb_btn|caption_btn|user_stats_btn|settings_back_btn|close_btn|"
@@ -363,7 +445,7 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
             text = (
                 f"<b>🗑 Current Dump Chat</b>\n\n"
                 f"<b>Chat ID:</b> <code>{current}</code>\n"
-                f"<b>Title:</b> {title}\n\n"
+                f"<b>Title:</b> {html.escape(title)}\n\n"
                 "<i>All saved files are automatically forwarded here.</i>\n"
                 "<i>Use /setchat &lt;chat_id&gt; to change, or /setchat clear to remove.</i>"
             )
@@ -402,8 +484,8 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
             preview = caption.format(filename="Video_File_2024.mp4", size="1.2 GB")
             text = (
                 f"<b>📝 Current Custom Caption</b>\n\n"
-                f"<code>{caption}</code>\n\n"
-                f"<b>Preview:</b>\n{preview}\n\n"
+                f"<code>{html.escape(caption)}</code>\n\n"
+                f"<b>Preview:</b>\n{html.escape(preview)}\n\n"
                 "<i>Placeholders: {filename}, {size}</i>\n"
                 "<i>/set_caption &lt;text&gt; to change • /del_caption to remove</i>"
             )
@@ -420,8 +502,8 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
         suffix = await db.get_suffix(user_id)
         text = (
             f"<b>🏷 Prefix / Suffix Settings</b>\n\n"
-            f"<b>Prefix:</b> <code>{prefix or 'Not set'}</code>\n"
-            f"<b>Suffix:</b> <code>{suffix or 'Not set'}</code>\n\n"
+            f"<b>Prefix:</b> <code>{html.escape(prefix) if prefix else 'Not set'}</code>\n"
+            f"<b>Suffix:</b> <code>{html.escape(suffix) if suffix else 'Not set'}</code>\n\n"
             f"<i>These are applied to every filename you save.</i>"
         )
         await safe_edit(callback_query, text, prefsuf_panel_buttons())
@@ -460,7 +542,6 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
         await safe_edit(callback_query, text, await metadata_panel_buttons(user_id))
 
     elif data.startswith("metadel_"):
-        # NEW: instant delete button for each metadata field, no typing required
         field = data[len("metadel_"):]
         await db.set_metadata_field(user_id, field, None)
         await callback_query.answer(f"{METADATA_LABELS.get(field, field)} deleted ✅", show_alert=False)
@@ -475,23 +556,18 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
     elif data.startswith("meta_"):
         field = data[len("meta_"):]
         current = await db.get_metadata_field(user_id, field)
-        PENDING_INPUT[user_id] = {"type": "metadata", "field": field}
-        text = (
-            f"<b>{METADATA_LABELS.get(field, field)}</b>\n\n"
-            f"<b>Current value:</b> <code>{current or 'Not set (original metadata preserved)'}</code>\n\n"
-            f"<i>Send the new value as a text message.</i>\n"
-            f"<i>Send <code>{{file_name}}</code> to use the saved filename automatically.</i>\n"
-            f"<i>Send <code>clear</code> to remove this field.</i>"
-        )
-        await safe_edit(
-            callback_query,
-            text,
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑 Delete This Field", callback_data=f"metadel_{field}")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="metadata_btn"),
-                 InlineKeyboardButton("❌ Close", callback_data="close_btn")]
-            ])
-        )
+        text = metadata_field_text(field, current)
+        await safe_edit(callback_query, text, metadata_field_buttons(field))
+
+        # Store WHICH message to edit once the user replies with a value,
+        # so the confirmation can edit this exact panel in place.
+        prompt_msg = callback_query.message
+        PENDING_INPUT[user_id] = {
+            "type": "metadata",
+            "field": field,
+            "chat_id": prompt_msg.chat.id,
+            "message_id": prompt_msg.id,
+        }
 
     elif data == "user_stats_btn":
         is_premium = await db.check_premium(user_id)
