@@ -37,10 +37,25 @@ def main_settings_buttons():
     ])
 
 
-def metadata_panel_buttons():
+def _truncate(value, length=18):
+    if not value:
+        return ""
+    value = str(value)
+    return value if len(value) <= length else value[:length - 1] + "…"
+
+
+async def metadata_panel_buttons(user_id):
+    """Builds the metadata panel with a live value preview and a dedicated
+    delete button under every field (so users don't have to type 'clear')."""
+    current_meta = await db.get_metadata(user_id)
     rows = []
     for field in METADATA_FIELDS:
-        rows.append([InlineKeyboardButton(METADATA_LABELS[field], callback_data=f"meta_{field}")])
+        label = METADATA_LABELS[field]
+        value = current_meta.get(field)
+        btn_text = f"{label}: {_truncate(value)}" if value else f"{label} (Not set)"
+        rows.append([InlineKeyboardButton(btn_text, callback_data=f"meta_{field}")])
+        if value:
+            rows.append([InlineKeyboardButton(f"🗑 Delete {label}", callback_data=f"metadel_{field}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="settings_back_btn"),
                  InlineKeyboardButton("❌ Close", callback_data="close_btn")])
     return InlineKeyboardMarkup(rows)
@@ -111,15 +126,7 @@ async def direct_commands(client: Client, message: Message):
 
 
 # ======================================================
-# /setchat - Set or Clear Dump Chat (FIXED)
-#
-# Old bug: the chat_id was saved to the DB but the bot never actually
-# verified it could post there, and nothing in the rest of the codebase
-# ever read it back to forward saved files anywhere (that part is now
-# wired up in start.py's save/upload paths). Here we also actively test
-# that the bot can send a message to the target chat before confirming
-# success, so users get an immediate, accurate error instead of a silent
-# "fake success" that never actually forwards anything.
+# /setchat - Set or Clear Dump Chat
 # ======================================================
 @Client.on_message(filters.command("setchat") & filters.private)
 async def set_dump_chat(client: Client, message: Message):
@@ -149,7 +156,6 @@ async def set_dump_chat(client: Client, message: Message):
             parse_mode=enums.ParseMode.HTML
         )
 
-    # Verify the bot can actually see and post to this chat BEFORE saving.
     try:
         chat = await client.get_chat(chat_id)
         chat_title = chat.title or "Private Chat"
@@ -259,13 +265,13 @@ async def metadata_cmd(client: Client, message: Message):
 
     text = (
         "<b>🎬 Metadata Settings</b>\n\n"
-        "<i>Tap a field below to view/edit it. These values are embedded "
-        "into your saved video/audio files via ffmpeg.</i>\n\n"
+        "<i>Tap a field below to view/edit it, or tap 🗑 to delete it instantly. "
+        "These values are embedded into your saved video/audio files via ffmpeg.</i>\n\n"
         "<i>Tip: send <code>{file_name}</code> (literally) as the value for "
         "any field to automatically use the saved file's name there - this "
         "is commonly used for the Title field.</i>"
     )
-    await message.reply_text(text, reply_markup=metadata_panel_buttons(), parse_mode=enums.ParseMode.HTML)
+    await message.reply_text(text, reply_markup=await metadata_panel_buttons(user_id), parse_mode=enums.ParseMode.HTML)
 
 
 # ======================================================
@@ -317,13 +323,26 @@ async def capture_pending_input(client: Client, message: Message):
 
 # ======================================================
 # Callbacks - Full Settings Navigation
+#
+# FIX: this handler is now pinned to group=-1 (same as the text-input
+# capture handler above). Previously it relied on the default group (0),
+# which it shared with the catch-all `@Client.on_callback_query()` in
+# start.py. Pyrogram only runs the FIRST matching handler within a group,
+# and which file's plugin gets registered first is not guaranteed (it
+# depends on filesystem/import order) — so depending on load order, the
+# generic start.py handler could silently swallow metadata_btn / meta_*
+# callbacks before they ever reached this logic, making "Metadata
+# Settings" appear randomly broken. Pinning this to group=-1 makes it
+# always run first, deterministically.
 # ======================================================
 @Client.on_callback_query(filters.regex(
     "^(cmd_list_btn|dump_chat_btn|thumb_btn|caption_btn|user_stats_btn|settings_back_btn|close_btn|"
     "prefsuf_btn|metadata_btn|set_prefix_btn|set_suffix_btn|clear_prefix_btn|clear_suffix_btn|"
     "meta_METADATA_TITLE|meta_METADATA_AUTHOR|meta_METADATA_ARTIST|meta_METADATA_DESCRIPTION|"
-    "meta_METADATA_COMMENT|meta_METADATA_VIDEO_TITLE|meta_METADATA_AUDIO_TITLE|meta_METADATA_SUBTITLE_TITLE)$"
-))
+    "meta_METADATA_COMMENT|meta_METADATA_VIDEO_TITLE|meta_METADATA_AUDIO_TITLE|meta_METADATA_SUBTITLE_TITLE|"
+    "metadel_METADATA_TITLE|metadel_METADATA_AUTHOR|metadel_METADATA_ARTIST|metadel_METADATA_DESCRIPTION|"
+    "metadel_METADATA_COMMENT|metadel_METADATA_VIDEO_TITLE|metadel_METADATA_AUDIO_TITLE|metadel_METADATA_SUBTITLE_TITLE)$"
+), group=-1)
 async def settings_callbacks(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
@@ -434,11 +453,24 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
     elif data == "metadata_btn":
         text = (
             "<b>🎬 Metadata Settings</b>\n\n"
-            "<i>Tap a field below to view/edit it.</i>\n\n"
+            "<i>Tap a field to view/edit it, or tap 🗑 to delete it instantly.</i>\n\n"
             "<i>Tip: send <code>{file_name}</code> (literally) as the value to "
             "automatically use the saved file's name there.</i>"
         )
-        await safe_edit(callback_query, text, metadata_panel_buttons())
+        await safe_edit(callback_query, text, await metadata_panel_buttons(user_id))
+
+    elif data.startswith("metadel_"):
+        # NEW: instant delete button for each metadata field, no typing required
+        field = data[len("metadel_"):]
+        await db.set_metadata_field(user_id, field, None)
+        await callback_query.answer(f"{METADATA_LABELS.get(field, field)} deleted ✅", show_alert=False)
+        text = (
+            "<b>🎬 Metadata Settings</b>\n\n"
+            "<i>Tap a field to view/edit it, or tap 🗑 to delete it instantly.</i>\n\n"
+            "<i>Tip: send <code>{file_name}</code> (literally) as the value to "
+            "automatically use the saved file's name there.</i>"
+        )
+        await safe_edit(callback_query, text, await metadata_panel_buttons(user_id))
 
     elif data.startswith("meta_"):
         field = data[len("meta_"):]
@@ -454,8 +486,11 @@ async def settings_callbacks(client: Client, callback_query: CallbackQuery):
         await safe_edit(
             callback_query,
             text,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="metadata_btn"),
-                                    InlineKeyboardButton("❌ Close", callback_data="close_btn")]])
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete This Field", callback_data=f"metadel_{field}")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="metadata_btn"),
+                 InlineKeyboardButton("❌ Close", callback_data="close_btn")]
+            ])
         )
 
     elif data == "user_stats_btn":
