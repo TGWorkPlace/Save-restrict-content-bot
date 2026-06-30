@@ -1223,4 +1223,16 @@ async def button_callbacks(client: Client, callback_query: CallbackQuery):
             show_alert=True
         )
 
+    else:
+        # Anything we don't explicitly recognize here (e.g. prefsuf_btn,
+        # metadata_btn, meta_*, set_prefix_btn, set_suffix_btn, ...) belongs
+        # to the dedicated handler in cantarella/settings.py. This handler
+        # has no filter, so it matches EVERY callback, and Pyrogram stops
+        # dispatching after the first handler that runs - without this,
+        # an unrecognized data string would silently fall through to
+        # callback_query.answer() below and never reach settings.py at all.
+        # Raising ContinuePropagation hands the update off to the next
+        # matching handler instead of swallowing it here.
+        raise pyrogram.ContinuePropagation
+
     await callback_query.answer()
